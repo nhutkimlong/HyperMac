@@ -118,9 +118,23 @@ public final class SystemMonitorManager: ObservableObject {
         sampleMetrics()
     }
 
+    private var isPopoverVisible: Bool = false
+
+    /// Điều phối trạng thái lấy mẫu khi popover mở/đóng.
+    /// Khi mở popover: lập tức lấy mẫu để UI hiển thị số liệu thực tế ngay mà không chờ.
+    /// Khi đóng popover: nếu không bật hiển thị Menu Bar thì lập tức hủy timer để tiết kiệm 100% CPU.
+    public func setPopoverVisible(_ visible: Bool) {
+        guard isPopoverVisible != visible else { return }
+        isPopoverVisible = visible
+        if visible {
+            sampleMetrics()
+        }
+        syncPollingState()
+    }
+
     private func handleSystemWake() {
         prevCoreTicks = nil
-        if showCPURAMMenuBar || showGPUMenuBar {
+        if showCPURAMMenuBar || showGPUMenuBar || isPopoverVisible {
             syncPollingState()
         }
     }
@@ -129,7 +143,7 @@ public final class SystemMonitorManager: ObservableObject {
         initialDeltaWork?.cancel()
         initialDeltaWork = nil
 
-        let shouldPoll = showCPURAMMenuBar || showGPUMenuBar
+        let shouldPoll = showCPURAMMenuBar || showGPUMenuBar || isPopoverVisible
         guard shouldPoll else {
             pollTimer?.invalidate()
             pollTimer = nil
@@ -138,13 +152,13 @@ public final class SystemMonitorManager: ObservableObject {
             return
         }
 
-        let needsInitialCPUDelta = showCPURAMMenuBar && (prevCoreTicks == nil)
+        let needsInitialCPUDelta = (showCPURAMMenuBar || isPopoverVisible) && (prevCoreTicks == nil)
         sampleMetrics()
 
         if needsInitialCPUDelta {
             let work = DispatchWorkItem { [weak self] in
                 Task { @MainActor [weak self] in
-                    guard let self, self.showCPURAMMenuBar else { return }
+                    guard let self, self.showCPURAMMenuBar || self.isPopoverVisible else { return }
                     self.sampleMetrics()
                 }
             }

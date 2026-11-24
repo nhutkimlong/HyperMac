@@ -525,9 +525,10 @@ public class ThermalManager: ObservableObject {
         if hot <= 0 && smc.hotspot > 0 { hot = smc.hotspot }
 
         sensors = smc.cpu + smc.gpu + sensors
-        let newCpu = cpu > 0 ? smooth(self.cpuAvgTemp, cpu) : self.cpuAvgTemp
-        let newPeak = peak > 0 ? smooth(self.cpuPeakTemp, peak) : self.cpuPeakTemp
-        let newGpu = gpu > 0 ? smooth(self.gpuAvgTemp, gpu) : self.gpuAvgTemp
+        // Phản ánh chính xác 100% số liệu đo tức thì từ phần cứng SMC/HID, không làm trễ hay giảm số
+        let newCpu = cpu > 0 ? cpu : self.cpuAvgTemp
+        let newPeak = peak > 0 ? peak : self.cpuPeakTemp
+        let newGpu = gpu > 0 ? gpu : self.gpuAvgTemp
 
         if isPopoverVisible {
             if cpu > 0 { self.cpuAvgTemp = newCpu }

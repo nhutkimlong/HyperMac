@@ -190,7 +190,17 @@ case "$1" in
         echo "MODE:" $("$SMC" -k "F${ID}Md" -r 2>/dev/null || true)
         ;;
     version)
-        echo "HELPER_VERSION:3"
+        echo "HELPER_VERSION:4"
+        ;;
+    purge)
+        if [ -x "/usr/sbin/purge" ]; then
+            /usr/sbin/purge >/dev/null 2>&1
+            echo "PURGE_OK"
+            exit 0
+        else
+            echo "ERROR: /usr/sbin/purge not found"
+            exit 1
+        fi
         ;;
     fan-set)
         ID="${2:-0}"

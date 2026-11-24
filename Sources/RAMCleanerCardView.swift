@@ -109,7 +109,7 @@ public struct RAMCleanerCardView: View {
             HStack(spacing: 12) {
                 legendItem(
                     color: memoryColor(percent: memoryManager.ramInfo.usedPercent),
-                    label: tr("Ứng dụng", "App"),
+                    label: tr("Đã dùng", "Used"),
                     val: MemoryCleanerManager.formatBytes(Int64(memoryManager.ramInfo.usedBytes))
                 )
 
@@ -121,7 +121,7 @@ public struct RAMCleanerCardView: View {
 
                 legendItem(
                     color: Color.green.opacity(0.8),
-                    label: tr("Khả dụng", "Available"),
+                    label: tr("Trống", "Free"),
                     val: MemoryCleanerManager.formatBytes(Int64(memoryManager.ramInfo.freeBytes))
                 )
 

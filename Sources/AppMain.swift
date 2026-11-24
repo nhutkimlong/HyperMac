@@ -243,6 +243,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         PermissionsManager.shared.setPopoverVisible(true)
         ThermalManager.shared.setPopoverVisible(true)
         FanManager.shared.setPopoverVisible(true)
+        SystemMonitorManager.shared.setPopoverVisible(true)
         DisplayManager.shared.checkAccessibility()
     }
 
@@ -252,6 +253,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         PermissionsManager.shared.setPopoverVisible(false)
         ThermalManager.shared.setPopoverVisible(false)
         FanManager.shared.setPopoverVisible(false)
+        SystemMonitorManager.shared.setPopoverVisible(false)
         MemoryCleanerManager.shared.stopMonitoring()
     }
 }

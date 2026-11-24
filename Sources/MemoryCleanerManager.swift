@@ -140,20 +140,23 @@ public final class MemoryCleanerManager: ObservableObject {
     }
 
     /// Dọn RAM 1-Click:
-    /// 1. Thử gọi purge đặc quyền qua helper (nếu sudo được cấp phép)
-    /// 2. Giải phóng bộ nhớ đệm app (malloc zone relief, URLCache, ImageIO)
-    /// 3. Kích hoạt chu trình thu hồi bộ nhớ không tải (inactive/purgeable)
+    /// 1. Gọi lệnh purge qua helper đặc quyền (hoặc sudo /usr/sbin/purge) để thu hồi buffer cache kernel
+    /// 2. Giải phóng bộ nhớ đệm app (URLCache, malloc zone relief)
+    /// 3. Kích thích Darwin VM reclaimer thu hồi inactive/purgeable pages và unmap ngay lập tức
     public func cleanRAM() {
         guard !isCleaning else { return }
         isCleaning = true
         statusMessage = nil
 
         let beforeInfo = Self.queryRAMInfo()
-        appLog("⚡️ Bắt đầu dọn RAM... Trước dọn: Free=\(Self.formatBytes(Int64(beforeInfo.freeBytes))), Cache=\(Self.formatBytes(Int64(beforeInfo.cacheBytes)))")
+        appLog("⚡️ Bắt đầu dọn RAM... Trước dọn: Free=\(Self.formatBytes(Int64(beforeInfo.freeBytes))), Cache=\(Self.formatBytes(Int64(beforeInfo.cacheBytes))), Used=\(Self.formatBytes(Int64(beforeInfo.usedBytes)))")
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            // 1. Thử dọn bộ đệm đĩa kernel qua purge nếu có quyền sudo
-            _ = shell("sudo -n /usr/sbin/purge 2>/dev/null || true")
+            // 1. Thử dọn bộ đệm đĩa kernel qua helper đặc quyền v4 hoặc sudo purge
+            let helperOut = shell("\(PrivilegedHelper.sudo("purge")) 2>/dev/null || true")
+            if !helperOut.output.contains("PURGE_OK") {
+                _ = shell("sudo -n /usr/sbin/purge 2>/dev/null || true")
+            }
 
             // 2. Thu hồi các bộ đệm rác nội bộ & giải phóng cache trong tiến trình
             DispatchQueue.main.async {
@@ -161,55 +164,41 @@ public final class MemoryCleanerManager: ObservableObject {
             }
             malloc_zone_pressure_relief(nil, 0)
 
-            // 3. Kích thích Darwin VM reclaimer thu hồi inactive pages một cách an toàn
-            // Dùng khối dung lượng nhỏ an toàn để hệ điều hành nén và dọn dẹp bộ nhớ đệm dư thừa
+            // 3. Kích thích Darwin VM reclaimer thu hồi inactive pages bằng mmap ẩn danh (không làm phình heap của app)
             let cacheToReclaim = beforeInfo.cacheBytes
             if cacheToReclaim > 100 * 1024 * 1024 {
-                // Thử kích hoạt thu hồi tối đa 1.5GB hoặc 50% inactive cache
-                let maxTarget = min(UInt64(1536 * 1024 * 1024), cacheToReclaim / 2)
-                let chunkSize = 64 * 1024 * 1024 // 64 MB
-                let chunks = max(2, Int(maxTarget / UInt64(chunkSize)))
-                var allocations: [UnsafeMutableRawPointer] = []
-
-                for _ in 0..<chunks {
-                    var ptr: UnsafeMutableRawPointer? = nil
-                    if posix_memalign(&ptr, 4096, chunkSize) == 0, let p = ptr {
-                        allocations.append(p)
-                        // Chạm trang với bước 16KB để báo hiệu kernel
-                        var offset = 0
-                        while offset < chunkSize {
-                            p.advanced(by: offset).storeBytes(of: 0, as: UInt8.self)
-                            offset += 16384
-                        }
+                let maxTarget = min(UInt64(1024 * 1024 * 1024), cacheToReclaim / 2)
+                let allocSize = Int(maxTarget)
+                if allocSize > 0, let ptr = mmap(nil, allocSize, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0), ptr != MAP_FAILED {
+                    var offset = 0
+                    while offset < allocSize {
+                        ptr.advanced(by: offset).storeBytes(of: 1, as: UInt8.self)
+                        offset += 32768
                     }
+                    munmap(ptr, allocSize)
                 }
-
-                // Giải phóng ngay lập tức
-                for p in allocations {
-                    madvise(p, chunkSize, MADV_FREE_REUSABLE)
-                    free(p)
-                }
-                allocations.removeAll()
             }
+
+            // Giải phóng heap malloc vùng nhớ trống về kernel
+            malloc_zone_pressure_relief(nil, 0)
 
             // Đồng bộ hoá hệ thống
             sync()
 
-            // Nghỉ 0.4s để Mach kernel cập nhật thống kê VM
-            Thread.sleep(forTimeInterval: 0.4)
+            // Nghỉ 0.5s để Mach kernel cập nhật thống kê VM
+            Thread.sleep(forTimeInterval: 0.5)
 
             let afterInfo = Self.queryRAMInfo()
-            let freed: Int64 = max(0, Int64(afterInfo.freeBytes) - Int64(beforeInfo.freeBytes))
+            let freedByFree = Int64(afterInfo.freeBytes) - Int64(beforeInfo.freeBytes)
+            let freedByUsed = Int64(beforeInfo.usedBytes) - Int64(afterInfo.usedBytes)
+            let freedByCache = Int64(beforeInfo.cacheBytes) - Int64(afterInfo.cacheBytes)
+            let reportedFreed: Int64 = max(0, max(freedByFree, max(freedByUsed, freedByCache)))
 
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
                 self.ramInfo = afterInfo
                 self.isCleaning = false
                 self.lastCleanedAt = Date()
-
-                // Nếu lượng free tăng rõ rệt thì báo đúng số byte tăng,
-                // nếu cache được nén hoặc chuyển đổi thì báo số tối ưu
-                let reportedFreed = freed > 0 ? freed : max(0, Int64(beforeInfo.usedBytes) - Int64(afterInfo.usedBytes))
                 self.lastFreedBytes = reportedFreed
 
                 if reportedFreed > 50 * 1024 * 1024 {
