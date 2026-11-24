@@ -341,17 +341,17 @@ public class DisplayManager: ObservableObject {
 
         // 🛡️ Safety Auto-Restore Guard:
         // Nếu không còn màn hình ngoài nào hoạt động (ví dụ người dùng vừa rút cáp màn hình ngoài),
-        // và màn hình chính MacBook đang bị tắt mềm hoặc đang ở độ sáng 0% hoặc nắp máy đang mở
+        // và màn hình chính MacBook đang bị tắt mềm hoặc đang ở độ sáng 0% hoặc đang Blackout
         // -> TỰ ĐỘNG BẬT LẠI MÀN HÌNH CHÍNH NGAY LẬP TỨC!
         let activeExternalCount = updatedList.filter { !$0.isBuiltIn && !$0.isVirtual && $0.isConnected }.count
         if activeExternalCount == 0, let primary = updatedList.first(where: { $0.isBuiltIn }) {
             let isBlackout = VirtualDisplayManager.shared.isBlackoutPrimaryActive
             let isZeroBrightness = primary.brightness < 0.05
-            let isLidOpen = !Self.isClamshellClosed()
+            let isSoftDisconnected = !primary.isConnected
 
-            // Nếu rút dây ra VÀ (màn đang tắt mềm HOẶC đang blackout HOẶC độ sáng = 0 HOẶC nắp máy mở):
-            if !primary.isConnected || isBlackout || isZeroBrightness || isLidOpen {
-                appLog("🚨 Safety Guard: No active external display! Restoring Built-in screen immediately (isLidOpen=\(isLidOpen))...")
+            // CHỈ phục hồi khi màn hình chính THỰC SỰ đang bị tắt/tối (tránh vòng lặp vô tận gây ăn CPU!)
+            if isSoftDisconnected || isBlackout || isZeroBrightness {
+                appLog("🚨 Safety Guard: No active external display and primary screen is off! Restoring Built-in screen immediately...")
                 DispatchQueue.main.async { [weak self] in
                     self?.restorePrimaryDisplay()
                 }
@@ -843,8 +843,6 @@ public class DisplayManager: ObservableObject {
             monitors[idx].isConnected = true
             monitors[idx].brightness = target
         }
-
-        refreshDisplays()
     }
 
     /// Kiểm tra và cưỡng chế cứu màn hình chính nếu không có màn ngoài hoặc nắp máy đang mở
