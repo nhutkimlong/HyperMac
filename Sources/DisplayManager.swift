@@ -1,0 +1,881 @@
+import Foundation
+import CoreGraphics
+import IOKit
+import AppKit
+import Combine
+
+// MARK: - Display Model
+
+public struct DisplayInfo: Identifiable, Equatable, Sendable {
+    public let id: CGDirectDisplayID
+    public var name: String
+    public let isBuiltIn: Bool
+    public var brightness: Double   // 0.0 ... 1.0
+    public var volume: Double = 0.5 // 0.0 ... 1.0 (for external monitors via DDC)
+    public var isMuted: Bool = false
+    public var isConnected: Bool   // true = active in WindowServer, false = soft-disconnected
+    public var resolution: String
+    public var externalIndex: Int?
+    public var isVirtual: Bool = false
+
+    public static func == (lhs: DisplayInfo, rhs: DisplayInfo) -> Bool {
+        lhs.id == rhs.id &&
+        abs(lhs.brightness - rhs.brightness) < 0.001 &&
+        abs(lhs.volume - rhs.volume) < 0.001 &&
+        lhs.isMuted == rhs.isMuted &&
+        lhs.isConnected == rhs.isConnected &&
+        lhs.name == rhs.name &&
+        lhs.resolution == rhs.resolution &&
+        lhs.isVirtual == rhs.isVirtual
+    }
+}
+
+// MARK: - Private DisplayServices Function Signatures (Apple Silicon Native)
+
+private typealias GetBrightnessFunc = @convention(c) (CGDirectDisplayID, UnsafeMutablePointer<Float>) -> Int32
+private typealias SetBrightnessFunc = @convention(c) (CGDirectDisplayID, Float) -> Int32
+
+// MARK: - Display Manager
+
+@MainActor
+public class DisplayManager: ObservableObject {
+    public static let shared = DisplayManager()
+
+    @Published public var monitors: [DisplayInfo] = []
+    @Published public var selectedID: CGDirectDisplayID? = nil
+    @Published public var isCursorBased: Bool = true {
+        didSet {
+            UserDefaults.standard.set(isCursorBased, forKey: "cursor_based_brightness")
+            gIsCursorBasedBrightnessEnabled = isCursorBased
+        }
+    }
+    @Published public var isMouseChordEnabled: Bool = true {
+        didSet {
+            gIsMouseChordEnabled = isMouseChordEnabled
+        }
+    }
+    @Published public var isRefreshing: Bool = false
+    @Published public var hasAccessibility: Bool = false
+    @Published public var selectedMainTab: Int = 0
+    @Published public var alertMessage: String? = nil
+    @Published public var showAlert: Bool = false
+
+    private var brightnessCache: [CGDirectDisplayID: Double] = [:]
+    private var volumeCache: [CGDirectDisplayID: Double] = [:]
+    private var savedVolumeBeforeMute: [CGDirectDisplayID: Double] = [:]
+    private var cachedDisplayNames: [CGDirectDisplayID: String] = [:]
+    private var cachedDisplayResolutions: [CGDirectDisplayID: String] = [:]
+    private var dsGetBrightness: GetBrightnessFunc?
+    private var dsSetBrightness: SetBrightnessFunc?
+    private var permCheckTimer: Timer?
+    private var accessibilityObserver: NSObjectProtocol?
+
+    private init() {
+        appLog("🚀 DisplayManager: Initializing...")
+        // Load DisplayServices for Apple Silicon Built-in display brightness
+        if let handle = dlopen("/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices", RTLD_NOW) {
+            if let symGet = dlsym(handle, "DisplayServicesGetBrightness") {
+                self.dsGetBrightness = unsafeBitCast(symGet, to: GetBrightnessFunc.self)
+            }
+            if let symSet = dlsym(handle, "DisplayServicesSetBrightness") {
+                self.dsSetBrightness = unsafeBitCast(symSet, to: SetBrightnessFunc.self)
+            }
+        }
+
+        if let savedChord = UserDefaults.standard.object(forKey: "mouse_chord_enabled") as? Bool {
+            self.isMouseChordEnabled = savedChord
+        }
+
+        if let savedCursor = UserDefaults.standard.object(forKey: "cursor_based_brightness") as? Bool {
+            self.isCursorBased = savedCursor
+        } else {
+            self.isCursorBased = true
+        }
+        gIsCursorBasedBrightnessEnabled = self.isCursorBased
+
+        // Reset any stale gamma LUT overrides to native ColorSync
+        CGDisplayRestoreColorSyncSettings()
+
+        refreshDisplays()
+
+        if let first = monitors.first {
+            self.selectedID = first.id
+        }
+
+        self.hasAccessibility = AXIsProcessTrusted()
+
+        syncAccessibilityPolling()
+
+        // macOS phát thông báo mỗi khi danh sách quyền Accessibility đổi: kiểm tra lại tức thì kể cả khi timer đã dừng.
+        accessibilityObserver = DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("com.apple.accessibility.api"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            // Trạng thái quyền cập nhật trễ nhẹ sau thông báo hệ thống.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                Task { @MainActor [weak self] in
+                    self?.checkAccessibility()
+                }
+            }
+        }
+
+        // 🛡️ Lắng nghe sự kiện hệ thống đánh thức / mở nắp máy / mở màn hình (System Wake / Screen Wake)
+        // Khi người dùng gập máy rút dây mang về nhà rồi mở nắp laptop ra -> TỰ ĐỘNG BẬT SÁNG LẠI MÀN HÌNH CHÍNH!
+        let wsNC = NSWorkspace.shared.notificationCenter
+        wsNC.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                appLog("☀️ System did wake: Refreshing displays and verifying built-in screen...")
+                self?.refreshDisplays()
+                self?.verifyAndRescueBuiltInIfNeeded()
+            }
+        }
+
+        wsNC.addObserver(
+            forName: NSWorkspace.screensDidWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                appLog("☀️ Screens did wake: Refreshing displays and verifying built-in screen...")
+                self?.refreshDisplays()
+                self?.verifyAndRescueBuiltInIfNeeded()
+            }
+        }
+    }
+
+    deinit {
+        permCheckTimer?.invalidate()
+        if let observer = accessibilityObserver {
+            DistributedNotificationCenter.default().removeObserver(observer)
+        }
+    }
+
+    private func syncAccessibilityPolling() {
+        let ready = hasAccessibility && KeyInterceptor.shared.currentTap != nil
+        if ready {
+            permCheckTimer?.invalidate()
+            permCheckTimer = nil
+        } else if permCheckTimer == nil {
+            let t = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.checkAccessibility()
+                }
+            }
+            t.tolerance = 0.5
+            RunLoop.main.add(t, forMode: .common)
+            permCheckTimer = t
+        }
+    }
+
+    // MARK: - Accessibility Check
+
+    public func checkAccessibility() {
+        let trusted = AXIsProcessTrusted()
+        if self.hasAccessibility != trusted {
+            self.hasAccessibility = trusted
+            appLog("🔐 Accessibility status changed to: \(trusted)")
+        }
+        if trusted && KeyInterceptor.shared.currentTap == nil {
+            KeyInterceptor.shared.start()
+        } else if !trusted && KeyInterceptor.shared.currentTap != nil {
+            KeyInterceptor.shared.stop()
+        }
+        syncAccessibilityPolling()
+    }
+
+    public func requestAccessibility() {
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    // MARK: - Refresh Displays
+
+    public func refresh() {
+        isRefreshing = true
+        refreshDisplays()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            self?.isRefreshing = false
+        }
+    }
+
+    public func refreshDisplays() {
+        var displayIDs = [CGDirectDisplayID](repeating: 0, count: 16)
+        var count: UInt32 = 0
+        // SLSGetDisplayList lists ALL monitors including soft-disconnected ones
+        _ = SLSGetDisplayList(16, &displayIDs, &count)
+
+        let physicalExternalNames = getAppleSiliconExternalDisplayNames()
+        var externalIdx = 0
+        var updatedList: [DisplayInfo] = []
+
+        for i in 0..<Int(count) {
+            let id = displayIDs[i]
+            let isBuiltIn = CGDisplayIsBuiltin(id) != 0
+            let isActive = (CGDisplayIsActive(id) != 0)
+            let bounds = CGDisplayBounds(id)
+
+            let hasValidSize = (bounds.width > 10 && bounds.height > 10)
+            let isKnownDisplay = (cachedDisplayNames[id] != nil || monitors.contains(where: { $0.id == id }))
+
+            let vendor = CGDisplayVendorNumber(id)
+            let model = CGDisplayModelNumber(id)
+            let isVirtualDisplay = (vendor == 0x1234 && model == 0x5678) || (id == VirtualDisplayManager.shared.virtualDisplayID)
+
+            // If it's a virtual display but VirtualDisplayManager is disabled, completely skip and remove from cache
+            if isVirtualDisplay && !VirtualDisplayManager.shared.isVirtualDisplayActive {
+                cachedDisplayNames.removeValue(forKey: id)
+                cachedDisplayResolutions.removeValue(forKey: id)
+                continue
+            }
+
+            // Filter out truly non-existent phantom ports (empty GPU pipelines on Apple Silicon with vendor=0, model=0)
+            if !isBuiltIn && !isVirtualDisplay {
+                if vendor == 0 && model == 0 {
+                    cachedDisplayNames.removeValue(forKey: id)
+                    cachedDisplayResolutions.removeValue(forKey: id)
+                    continue
+                }
+                if !hasValidSize && !isKnownDisplay {
+                    continue
+                }
+            }
+
+            var currentExtIdx: Int? = nil
+            if !isBuiltIn && !isVirtualDisplay {
+                currentExtIdx = externalIdx
+                externalIdx += 1
+            }
+
+            let name = getDisplayName(
+                for: id,
+                isBuiltIn: isBuiltIn,
+                externalIndex: currentExtIdx,
+                physicalNames: physicalExternalNames
+            )
+
+            // Cache metadata when active or has real dimensions
+            if hasValidSize {
+                cachedDisplayNames[id] = name
+                cachedDisplayResolutions[id] = "\(Int(bounds.width)) × \(Int(bounds.height))"
+            }
+
+            let currentMode = CGDisplayCopyDisplayMode(id)
+            let isModeHiDPI = (currentMode != nil) && (currentMode!.pixelWidth > currentMode!.width || currentMode!.pixelHeight > currentMode!.height)
+
+            let resolution: String
+            if hasValidSize {
+                resolution = "\(Int(bounds.width)) × \(Int(bounds.height))" + (isModeHiDPI ? " · HiDPI" : "")
+            } else {
+                resolution = cachedDisplayResolutions[id] ?? tr("Đã ngắt mềm", "Soft-disconnected")
+            }
+
+            // Load cached brightness from hardware DDC, UserDefaults or in-memory cache
+            if !isBuiltIn && brightnessCache[id] == nil {
+                if let hw = DDCManager.shared.readBrightness() {
+                    let d = Double(hw) / 100.0
+                    brightnessCache[id] = d
+                    UserDefaults.standard.set(d, forKey: "brightness_\(id)")
+                } else if let saved = UserDefaults.standard.object(forKey: "brightness_\(id)") as? Double {
+                    brightnessCache[id] = saved
+                } else {
+                    brightnessCache[id] = 1.0
+                }
+            } else if brightnessCache[id] == nil {
+                if let saved = UserDefaults.standard.object(forKey: "brightness_\(id)") as? Double {
+                    brightnessCache[id] = saved
+                }
+            }
+
+            let currentBrightness: Double
+            if isBuiltIn {
+                currentBrightness = isActive ? getBuiltInBrightness(displayID: id) : (brightnessCache[id] ?? 0.8)
+            } else {
+                currentBrightness = brightnessCache[id] ?? 1.0
+            }
+
+            // Load cached volume for external displays
+            if volumeCache[id] == nil {
+                if let saved = UserDefaults.standard.object(forKey: "volume_\(id)") as? Double {
+                    volumeCache[id] = saved
+                } else {
+                    volumeCache[id] = 0.5
+                }
+            }
+            let currentVolume = volumeCache[id] ?? 0.5
+
+            let displayExtIndex = currentExtIdx.map { $0 + 1 }
+
+            updatedList.append(DisplayInfo(
+                id: id,
+                name: cachedDisplayNames[id] ?? name,
+                isBuiltIn: isBuiltIn,
+                brightness: currentBrightness,
+                volume: currentVolume,
+                isMuted: (currentVolume <= 0.001),
+                isConnected: isActive,
+                resolution: resolution,
+                externalIndex: displayExtIndex,
+                isVirtual: isVirtualDisplay
+            ))
+        }
+
+        updatedList.sort { a, b in
+            if a.isBuiltIn != b.isBuiltIn { return a.isBuiltIn }
+            return a.id < b.id
+        }
+
+        let knownIDs = Set(updatedList.map(\.id))
+        originalGamma = originalGamma.filter { knownIDs.contains($0.key) }
+
+        self.monitors = updatedList
+        DisplayModeManager.shared.refresh(displays: updatedList.filter(\.isConnected).map(\.id))
+        appLog("🖥 Display list refreshed. Total: \(updatedList.count) (Active: \(updatedList.filter { $0.isConnected }.count))")
+
+        // 🛡️ Safety Auto-Restore Guard:
+        // Nếu không còn màn hình ngoài nào hoạt động (ví dụ người dùng vừa rút cáp màn hình ngoài),
+        // và màn hình chính MacBook đang bị tắt mềm hoặc đang ở độ sáng 0% hoặc nắp máy đang mở
+        // -> TỰ ĐỘNG BẬT LẠI MÀN HÌNH CHÍNH NGAY LẬP TỨC!
+        let activeExternalCount = updatedList.filter { !$0.isBuiltIn && !$0.isVirtual && $0.isConnected }.count
+        if activeExternalCount == 0, let primary = updatedList.first(where: { $0.isBuiltIn }) {
+            let isBlackout = VirtualDisplayManager.shared.isBlackoutPrimaryActive
+            let isZeroBrightness = primary.brightness < 0.05
+            let isLidOpen = !Self.isClamshellClosed()
+
+            // Nếu rút dây ra VÀ (màn đang tắt mềm HOẶC đang blackout HOẶC độ sáng = 0 HOẶC nắp máy mở):
+            if !primary.isConnected || isBlackout || isZeroBrightness || isLidOpen {
+                appLog("🚨 Safety Guard: No active external display! Restoring Built-in screen immediately (isLidOpen=\(isLidOpen))...")
+                DispatchQueue.main.async { [weak self] in
+                    self?.restorePrimaryDisplay()
+                }
+            }
+        }
+
+        if selectedID == nil || !updatedList.contains(where: { $0.id == selectedID }) {
+            selectedID = updatedList.first?.id
+        }
+    }
+
+    // MARK: - Selection
+
+    public func selectMonitor(_ monitor: DisplayInfo) {
+        selectedID = monitor.id
+    }
+
+    public var selectedMonitor: DisplayInfo? {
+        monitors.first { $0.id == selectedID } ?? monitors.first
+    }
+
+    // MARK: - Display Name Lookup via IOKit (Apple Silicon & Intel)
+
+    private func getAppleSiliconExternalDisplayNames() -> [String] {
+        var names: [String] = []
+        var iter = io_iterator_t()
+        let matching = IOServiceMatching("AppleDisplayConnectionManager")
+        if IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iter) == kIOReturnSuccess {
+            var service = IOIteratorNext(iter)
+            while service != 0 {
+                var props: Unmanaged<CFMutableDictionary>?
+                if IORegistryEntryCreateCFProperties(service, &props, kCFAllocatorDefault, 0) == kIOReturnSuccess,
+                   let dict = props?.takeRetainedValue() as? [String: Any] {
+                    if let mapping = dict["ConnectionMapping"] as? [[String: Any]] {
+                        for m in mapping {
+                            if let name = m["ProductName"] as? String, !name.isEmpty {
+                                names.append(name)
+                            }
+                        }
+                    }
+                }
+                IOObjectRelease(service)
+                service = IOIteratorNext(iter)
+            }
+            IOObjectRelease(iter)
+        }
+        return names
+    }
+
+    private func getDisplayName(
+        for displayID: CGDirectDisplayID,
+        isBuiltIn: Bool,
+        externalIndex: Int? = nil,
+        physicalNames: [String] = []
+    ) -> String {
+        if isBuiltIn { return "Built-in Retina Display" }
+
+        let vendor = CGDisplayVendorNumber(displayID)
+        let model  = CGDisplayModelNumber(displayID)
+        if (vendor == 0x1234 && model == 0x5678) || (VirtualDisplayManager.shared.isVirtualDisplayActive && displayID == VirtualDisplayManager.shared.virtualDisplayID) {
+            return tr("Màn hình ảo (HyperMac)", "Virtual Display (HyperMac)")
+        }
+
+        // 1. Native AppKit NSScreen lookup (Most accurate for each specific active display)
+        for screen in NSScreen.screens {
+            if let num = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID,
+               num == displayID {
+                let localized = screen.localizedName
+                if !localized.isEmpty && localized != "Display" {
+                    return localized
+                }
+            }
+        }
+
+        // 2. Cached display name from previous active session
+        if let cached = cachedDisplayNames[displayID], !cached.isEmpty, cached != "External Display" {
+            return cached
+        }
+
+        // 3. Try classic IODisplayConnect (matched by target vendor + model)
+        let targetVendor = CGDisplayVendorNumber(displayID)
+        let targetModel  = CGDisplayModelNumber(displayID)
+
+        var iter = io_iterator_t()
+        if IOServiceGetMatchingServices(
+            kIOMainPortDefault,
+            IOServiceMatching("IODisplayConnect"),
+            &iter
+        ) == kIOReturnSuccess {
+            defer { IOObjectRelease(iter) }
+            var service = IOIteratorNext(iter)
+            while service != 0 {
+                defer {
+                    IOObjectRelease(service)
+                    service = IOIteratorNext(iter)
+                }
+
+                guard let infoRef = IODisplayCreateInfoDictionary(service, kIODisplayOnlyPreferredName) else {
+                    continue
+                }
+                let info = infoRef.takeRetainedValue() as NSDictionary
+
+                guard let v = info[kDisplayVendorIDKey] as? UInt32,
+                      let m = info[kDisplayProductIDKey] as? UInt32,
+                      v == targetVendor, m == targetModel else {
+                    continue
+                }
+
+                if let names = info[kDisplayProductNameKey] as? [String: String],
+                   let name = names.values.first, !name.isEmpty {
+                    return name
+                }
+            }
+        }
+
+        // 4. Fallback to physical external names list matching by specific monitor index
+        if let idx = externalIndex, idx >= 0, idx < physicalNames.count {
+            let name = physicalNames[idx]
+            if !name.isEmpty {
+                return name
+            }
+        }
+
+        let fallbackNum = (externalIndex ?? 0) + 1
+        return tr("Màn hình ngoài \(fallbackNum)", "External Display \(fallbackNum)")
+    }
+
+    // MARK: - Built-in Brightness via DisplayServices (Apple Silicon Native)
+
+    private func getBuiltInBrightness(displayID: CGDirectDisplayID) -> Double {
+        if let getFn = dsGetBrightness {
+            var val: Float = 0.5
+            if getFn(displayID, &val) == 0 {
+                return Double(val)
+            }
+        }
+        return 0.5
+    }
+
+    private func setBuiltInBrightness(displayID: CGDirectDisplayID, value: Float) {
+        if let setFn = dsSetBrightness {
+            _ = setFn(displayID, max(0.0, min(1.0, value)))
+        }
+    }
+
+    // MARK: - External Brightness via CoreGraphics Hardware Gamma LUT
+
+    /// Thấp hơn mức này màn gần như đen hẳn, người dùng dễ tưởng màn hỏng.
+    private static let minimumGammaBrightness = 0.15
+
+    /// Bảng gamma gốc của từng màn (theo profile ColorSync), chụp lần đầu khi chỉnh sáng.
+    private var originalGamma: [CGDirectDisplayID: (red: [CGGammaValue], green: [CGGammaValue], blue: [CGGammaValue])] = [:]
+
+    /// Chỉ khôi phục bảng gamma ColorSync khi HyperMac thực sự từng điều chỉnh độ sáng màn ngoài.
+    public func restoreHardwareGammaIfNeeded() {
+        originalGamma.removeAll()
+        CGDisplayRestoreColorSyncSettings()
+    }
+
+    /// Nhân bảng gamma gốc với hệ số sáng để giữ nguyên hiệu chỉnh màu ColorSync (thay vì ghi đè bằng đường thẳng).
+    private func setHardwareGamma(displayID: CGDirectDisplayID, brightness: Double) {
+        let original = originalGamma[displayID] ?? captureGamma(displayID)
+        originalGamma[displayID] = original
+
+        let factor = CGGammaValue(max(Self.minimumGammaBrightness, min(1.0, brightness)))
+        var red = original.red.map { $0 * factor }
+        var green = original.green.map { $0 * factor }
+        var blue = original.blue.map { $0 * factor }
+        _ = CGSetDisplayTransferByTable(displayID, UInt32(red.count), &red, &green, &blue)
+    }
+
+    private func captureGamma(_ displayID: CGDirectDisplayID) -> (red: [CGGammaValue], green: [CGGammaValue], blue: [CGGammaValue]) {
+        let capacity = max(Int(CGDisplayGammaTableCapacity(displayID)), 2)
+        var red = [CGGammaValue](repeating: 0, count: capacity)
+        var green = red, blue = red
+        var count: UInt32 = 0
+        if CGGetDisplayTransferByTable(displayID, UInt32(capacity), &red, &green, &blue, &count) == .success, count >= 2 {
+            let n = Int(count)
+            return (Array(red.prefix(n)), Array(green.prefix(n)), Array(blue.prefix(n)))
+        }
+        // Fallback tuyến tính nếu không đọc được bảng gamma hiện tại.
+        let ramp = (0..<256).map { CGGammaValue($0) / 255 }
+        return (ramp, ramp, ramp)
+    }
+
+    // MARK: - Clamshell State Detector (Kiểm tra nắp máy đóng/mở)
+    public static func isClamshellClosed() -> Bool {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        guard service != 0 else { return false }
+        defer { IOObjectRelease(service) }
+        var props: Unmanaged<CFMutableDictionary>?
+        if IORegistryEntryCreateCFProperties(service, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS,
+           let dict = props?.takeRetainedValue() as? [String: Any] {
+            if let val = dict["AppleClamshellState"] as? Bool {
+                return val
+            }
+        }
+        return false
+    }
+
+    // MARK: - Unified Brightness Setter
+
+    public func setBrightness(_ value: Double, for monitor: DisplayInfo) {
+        let clamped = max(0.0, min(1.0, value))
+        guard let idx = monitors.firstIndex(where: { $0.id == monitor.id }) else { return }
+        monitors[idx].brightness = clamped
+        brightnessCache[monitor.id] = clamped
+        UserDefaults.standard.set(clamped, forKey: "brightness_\(monitor.id)")
+
+        // Only apply hardware changes if monitor is active
+        guard monitors[idx].isConnected else { return }
+
+        appLog("💡 Setting brightness to \(Int(clamped * 100))% for '\(monitor.name)' (isBuiltIn: \(monitor.isBuiltIn))")
+
+        if monitor.isBuiltIn {
+            setBuiltInBrightness(displayID: monitor.id, value: Float(clamped))
+        } else {
+            // Restore neutral ColorSync gamma so colors/contrast are never crushed
+            restoreHardwareGammaIfNeeded()
+            // Adjust true physical backlight via DDC/CI VCP 0x10
+            DDCManager.shared.setBrightness(Int(round(clamped * 100)))
+        }
+    }
+
+    // MARK: - Keyboard F1 / F2 Brightness Handler
+
+    /// Called by KeyInterceptor when F1 (isUp == false, brightness down) or F2 (isUp == true, brightness up) is pressed.
+    /// Returns true if handled and swallowed (external display), or false to let macOS handle natively (built-in screen).
+    public func handleBrightnessKey(isUp: Bool) -> Bool {
+        let targetMonitor: DisplayInfo?
+        let mouseLoc = NSEvent.mouseLocation
+
+        if isCursorBased {
+            let screenUnderMouse = NSScreen.screens.first { NSMouseInRect(mouseLoc, $0.frame, false) }
+            let screenDisplayID = screenUnderMouse?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
+
+            if let did = screenDisplayID, let m = monitors.first(where: { $0.id == did }) {
+                targetMonitor = m
+            } else {
+                targetMonitor = selectedMonitor
+            }
+        } else {
+            targetMonitor = selectedMonitor
+        }
+
+        guard let monitor = targetMonitor, monitor.isConnected else {
+            appLog("⚠️ handleBrightnessKey: Target monitor is nil or disconnected.")
+            return false
+        }
+
+        appLog("🎯 handleBrightnessKey: isUp=\(isUp) | target='\(monitor.name)' (builtin=\(monitor.isBuiltIn)) | mouse=\(mouseLoc)")
+
+        // Step brightness by 1/16 (6.25% - standard Apple block)
+        let step = 0.0625
+        let current = monitor.brightness
+        // F2 = isUp (increase), F1 = !isUp (decrease)
+        let newBrightness = max(0.0, min(1.0, isUp ? (current + step) : (current - step)))
+
+        setBrightness(newBrightness, for: monitor)
+
+        let targetScreen = NSScreen.screens.first { s in
+            let did = s.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
+            return did == monitor.id
+        } ?? NSScreen.main
+        OSDManager.shared.show(title: monitor.name, brightness: newBrightness, on: targetScreen)
+
+        return true
+    }
+
+    // MARK: - Unified External Volume Setter via DDC/CI
+
+    public func setVolume(_ value: Double, for monitor: DisplayInfo) {
+        guard let idx = monitors.firstIndex(where: { $0.id == monitor.id }) else { return }
+        let clamped = max(0.0, min(1.0, value))
+        let isNowMuted = (clamped <= 0.001)
+
+        monitors[idx].volume = clamped
+        monitors[idx].isMuted = isNowMuted
+        volumeCache[monitor.id] = clamped
+        UserDefaults.standard.set(clamped, forKey: "volume_\(monitor.id)")
+
+        if !isNowMuted {
+            savedVolumeBeforeMute[monitor.id] = clamped
+        }
+
+        let intVol = Int(round(clamped * 100))
+        appLog("🔊 Setting DDC volume to \(intVol)% for '\(monitor.name)'")
+
+        // Đồng bộ cả VCP Volume và VCP Mute xuống phần cứng màn hình
+        DDCManager.shared.setMute(isNowMuted)
+        DDCManager.shared.setVolume(intVol)
+    }
+
+    public func toggleMute(for monitor: DisplayInfo) {
+        guard let idx = monitors.firstIndex(where: { $0.id == monitor.id }) else { return }
+        let willMute = !monitors[idx].isMuted
+        monitors[idx].isMuted = willMute
+
+        if willMute {
+            if monitors[idx].volume > 0.001 {
+                savedVolumeBeforeMute[monitor.id] = monitors[idx].volume
+            }
+            DDCManager.shared.setMute(true)
+            DDCManager.shared.setVolume(0)
+        } else {
+            let restored = savedVolumeBeforeMute[monitor.id] ?? 0.3
+            monitors[idx].volume = max(0.05, restored)
+            DDCManager.shared.setMute(false)
+            DDCManager.shared.setVolume(Int(round(monitors[idx].volume * 100)))
+        }
+    }
+
+    // MARK: - Keyboard Volume Keys Handler (External Displays)
+
+    public func handleVolumeKey(isUp: Bool) -> Bool {
+        guard let idx = monitors.firstIndex(where: { !$0.isBuiltIn && $0.isConnected }) else {
+            return false
+        }
+        let monitor = monitors[idx]
+
+        let step = 1.0 / 16.0 // 6.25% - bước âm lượng chuẩn của macOS
+        let current = monitor.isMuted ? 0.0 : monitor.volume
+        let newVolume = max(0.0, min(1.0, isUp ? (current + step) : (current - step)))
+        setVolume(newVolume, for: monitor)
+
+        let updatedMonitor = monitors[idx]
+        let targetScreen = NSScreen.screens.first { s in
+            let did = s.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
+            return did == updatedMonitor.id
+        } ?? NSScreen.main
+
+        let icon = (newVolume <= 0.01 || updatedMonitor.isMuted) ? "speaker.slash.fill" : (newVolume < 0.33 ? "speaker.wave.1.fill" : (newVolume < 0.66 ? "speaker.wave.2.fill" : "speaker.wave.3.fill"))
+        OSDManager.shared.show(title: updatedMonitor.name, iconName: icon, value: updatedMonitor.isMuted ? 0.0 : newVolume, on: targetScreen)
+        return true
+    }
+
+    public func handleMuteKey() -> Bool {
+        guard let idx = monitors.firstIndex(where: { !$0.isBuiltIn && $0.isConnected }) else {
+            return false
+        }
+        let monitor = monitors[idx]
+        toggleMute(for: monitor)
+
+        // Lấy lại monitor mới nhất sau khi toggleMute đã cập nhật state!
+        let updatedMonitor = monitors[idx]
+        let targetScreen = NSScreen.screens.first { s in
+            let did = s.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
+            return did == updatedMonitor.id
+        } ?? NSScreen.main
+
+        let isMuted = updatedMonitor.isMuted
+        let icon = isMuted ? "speaker.slash.fill" : (updatedMonitor.volume < 0.33 ? "speaker.wave.1.fill" : (updatedMonitor.volume < 0.66 ? "speaker.wave.2.fill" : "speaker.wave.3.fill"))
+        OSDManager.shared.show(title: updatedMonitor.name, iconName: icon, value: isMuted ? 0.0 : updatedMonitor.volume, on: targetScreen)
+        return true
+    }
+
+    // MARK: - True BetterDisplay-Style Display Connection Management
+
+    public func canDisconnect(_ monitor: DisplayInfo) -> Bool {
+        let activeCount = monitors.filter { $0.isConnected }.count
+        return activeCount > 1
+    }
+
+    public func toggleConnection(for monitor: DisplayInfo) {
+        guard let idx = monitors.firstIndex(where: { $0.id == monitor.id }) else { return }
+        let currentlyActive = monitors[idx].isConnected
+
+        if currentlyActive && !canDisconnect(monitor) {
+            alertMessage = tr("Không thể ngắt tất cả màn hình! macOS cần giữ lại ít nhất 1 màn hình (thật hoặc ảo) để WindowServer hoạt động.", "Cannot disconnect all displays! macOS requires at least 1 active display to operate.")
+            showAlert = true
+            return
+        }
+
+        let targetID = monitor.id
+        let shouldEnable = !currentlyActive
+
+        // 1. Nếu là màn hình chính MacBook (isBuiltIn), TUYỆT ĐỐI KHÔNG dùng SLSConfigureDisplayEnabled
+        // vì WindowServer trên Apple Silicon sẽ khóa chết màn hình chính và trả lỗi 1001 khi cố bật lại!
+        // Thay vào đó, dùng cơ chế Blackout (hạ độ sáng về 0 / tắt đèn nền), vừa tắt tối an toàn vừa không bao giờ bị kẹt.
+        if monitor.isBuiltIn {
+            if currentlyActive {
+                appLog("💡 Tắt màn hình MacBook bằng Blackout an toàn (độ sáng 0%)...")
+                VirtualDisplayManager.shared.blackoutPrimaryScreen()
+                monitors[idx].isConnected = false
+            } else {
+                appLog("💡 Bật lại màn hình MacBook an toàn (khôi phục độ sáng)...")
+                VirtualDisplayManager.shared.restorePrimaryScreen()
+                let saved = brightnessCache[targetID] ?? 0.8
+                let target = saved > 0.1 ? saved : 0.75
+                setBuiltInBrightness(displayID: targetID, value: Float(target))
+                monitors[idx].isConnected = true
+            }
+            refreshDisplays()
+            return
+        }
+
+        appLog("⚡️ toggleConnection: target='\(monitor.name)' (id=\(targetID)) -> willEnable=\(shouldEnable)")
+
+        var config: CGDisplayConfigRef?
+        guard CGBeginDisplayConfiguration(&config) == .success, let cfg = config else {
+            alertMessage = tr("Không thể khởi tạo phiên thay đổi cấu hình màn hình.", "Unable to initiate display configuration session.")
+            showAlert = true
+            return
+        }
+
+        // Use WindowServer private SkyLight API to cleanly soft-disconnect or connect
+        let confResult = SLSConfigureDisplayEnabled(cfg, targetID, shouldEnable)
+        guard confResult == .success else {
+            _ = CGCancelDisplayConfiguration(config)
+            alertMessage = tr("Lỗi thiết lập trạng thái màn hình (Mã lỗi: \(confResult.rawValue)).", "Error configuring display state (Error code: \(confResult.rawValue)).")
+            showAlert = true
+            return
+        }
+
+        let commitResult = CGCompleteDisplayConfiguration(config, .permanently)
+        guard commitResult == .success else {
+            CGRestorePermanentDisplayConfiguration()
+            if shouldEnable {
+                alertMessage = tr("Không thể bật lại màn hình ngoài. Có vẻ cáp kết nối đã bị rút khỏi máy hoặc màn hình bị mất nguồn điện.", "Cannot reconnect external display. Please check if cable is unplugged or display is powered off.")
+            } else {
+                alertMessage = tr("Lỗi áp dụng cấu hình màn hình vào WindowServer (Mã lỗi: \(commitResult.rawValue)).", "Error applying display config to WindowServer (Error code: \(commitResult.rawValue)).")
+            }
+            showAlert = true
+            refreshDisplays()
+            return
+        }
+
+        appLog("✅ toggleConnection committed to WindowServer successfully.")
+
+        // Update local state immediately
+        monitors[idx].isConnected = shouldEnable
+
+        if shouldEnable {
+            // Restore brightness on reconnect
+            let saved = brightnessCache[targetID] ?? 0.8
+            if monitor.isBuiltIn {
+                setBuiltInBrightness(displayID: targetID, value: Float(saved))
+            } else {
+                setHardwareGamma(displayID: targetID, brightness: saved)
+            }
+        }
+
+        // Refresh displays to sync with WindowServer desktop layout consolidation
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            self?.refreshDisplays()
+        }
+    }
+
+    // MARK: - Quick Presets
+
+    public func setQuickBrightness(_ percent: Double, for monitor: DisplayInfo) {
+        setBrightness(percent, for: monitor)
+    }
+
+    public func connectAllDisplays() {
+        for monitor in monitors where !monitor.isConnected {
+            toggleConnection(for: monitor)
+        }
+    }
+
+    /// Mở lại riêng màn hình chính (màn hình MacBook tích hợp) và khôi phục độ sáng
+    public func restorePrimaryDisplay() {
+        guard let primary = monitors.first(where: { $0.isBuiltIn }) else {
+            // Trường hợp máy bàn Mac mini/Studio không có built-in: mở màn hình vật lý đầu tiên
+            if let firstPhysical = monitors.first(where: { !$0.isVirtual }) {
+                if !firstPhysical.isConnected {
+                    toggleConnection(for: firstPhysical)
+                }
+                setBrightness(0.75, for: firstPhysical)
+            }
+            return
+        }
+        appLog("🖥 restorePrimaryDisplay: Restoring primary screen '\(primary.name)' (id=\(primary.id))")
+
+        // 1. Phục hồi cấu hình WindowServer nếu có bất kỳ màn hình nào bị ngắt mềm kẹt lại
+        CGRestorePermanentDisplayConfiguration()
+        CGDisplayRestoreColorSyncSettings()
+
+        // 2. Hủy trạng thái Blackout của màn hình chính
+        VirtualDisplayManager.shared.restorePrimaryScreen()
+
+        // 3. Buộc khôi phục độ sáng màn hình chính về 75% - 80%
+        let saved = brightnessCache[primary.id] ?? 0.8
+        let target = saved > 0.25 ? saved : 0.75
+        setBuiltInBrightness(displayID: primary.id, value: Float(target))
+        setBrightness(target, for: primary)
+
+        if let idx = monitors.firstIndex(where: { $0.id == primary.id }) {
+            monitors[idx].isConnected = true
+            monitors[idx].brightness = target
+        }
+
+        refreshDisplays()
+    }
+
+    /// Kiểm tra và cưỡng chế cứu màn hình chính nếu không có màn ngoài hoặc nắp máy đang mở
+    public func verifyAndRescueBuiltInIfNeeded() {
+        let activeExternalCount = monitors.filter { !$0.isBuiltIn && !$0.isVirtual && $0.isConnected }.count
+        guard let primary = monitors.first(where: { $0.isBuiltIn }) else { return }
+
+        let isBlackout = VirtualDisplayManager.shared.isBlackoutPrimaryActive
+        let isZeroBrightness = primary.brightness < 0.05
+        let isLidOpen = !Self.isClamshellClosed()
+
+        // Nếu không có màn ngoài VÀ nắp máy đang mở -> Bắt buộc màn hình chính phải sáng!
+        if activeExternalCount == 0 && isLidOpen {
+            if !primary.isConnected || isBlackout || isZeroBrightness {
+                appLog("🚨 verifyAndRescueBuiltIn: Lid is OPEN and NO external display! Forcing restorePrimaryDisplay immediately...")
+                restorePrimaryDisplay()
+            }
+        }
+    }
+
+    /// Khôi phục hiển thị khẩn cấp (Emergency Display Rescue):
+    /// Tự động bật lại toàn bộ màn hình đã ngắt, hủy tắt màn chính và đặt lại độ sáng an toàn 75%.
+    public func emergencyRestoreAllDisplays() {
+        appLog("🚨 Emergency restore triggered: Reconnecting all displays and resetting brightness...")
+        connectAllDisplays()
+        for monitor in monitors where !monitor.isVirtual {
+            if monitor.brightness < 0.25 {
+                setBrightness(0.75, for: monitor)
+            }
+        }
+        VirtualDisplayManager.shared.restorePrimaryScreen()
+        refreshDisplays()
+    }
+}

@@ -1,0 +1,261 @@
+#!/bin/bash
+# HyperMac Power & Battery SMC Management Helper
+
+# Chạy bằng root qua sudo: không tin $PATH người gọi, chỉ dùng smc là tệp thường do root sở hữu
+# nằm cạnh helper (cài bởi install-helper.sh). Không tìm smc ở thư mục user ghi được.
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+SMC="/Library/PrivilegedHelperTools/com.opensource.hypermac.smc"
+
+if [ ! -x "$SMC" ] || [ -L "$SMC" ] || [ "$(stat -f %u "$SMC")" != "0" ]; then
+    echo "ERROR: smc binary not found"
+    exit 1
+fi
+
+# Ngưỡng sạc hợp lệ: chỉ số nguyên 20..100. Phải kiểm tra TRƯỚC khi đưa vào $(( )) / printf
+# vì bash tính biểu thức số học kể cả với chuỗi kiểu 'a[$(lệnh)]'.
+valid_limit() {
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$1" -ge 20 ] && [ "$1" -le 100 ]
+}
+
+check_key_exists() {
+    local key="$1"
+    local out
+    out=$("$SMC" -k "$key" -r 2>&1 || true)
+    if echo "$out" | grep -qv "no data" && echo "$out" | grep -q "$key"; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+case "$1" in
+    status)
+        BYPASSED=0
+        FOUND_KEY=0
+
+        if check_key_exists "CHTE"; then
+            FOUND_KEY=1
+            OUT=$("$SMC" -k CHTE -r 2>/dev/null || true)
+            echo "$OUT"
+            if echo "$OUT" | grep -q "01 00 00 00" || echo "$OUT" | grep -q "16777216"; then
+                BYPASSED=1
+            fi
+        fi
+
+        if check_key_exists "CH0B"; then
+            FOUND_KEY=1
+            OUT=$("$SMC" -k CH0B -r 2>/dev/null || true)
+            echo "$OUT"
+            if echo "$OUT" | grep -q "02"; then
+                BYPASSED=1
+            fi
+        fi
+
+        if check_key_exists "bfF0"; then
+            FOUND_KEY=1
+            OUT=$("$SMC" -k bfF0 -r 2>/dev/null || true)
+            echo "$OUT"
+            if echo "$OUT" | grep -q "02" || echo "$OUT" | grep -q "\[ui8 \]  2" || echo "$OUT" | grep -q "\[ui8 \]  1"; then
+                BYPASSED=1
+            fi
+        fi
+
+        if check_key_exists "BCLM"; then
+            FOUND_KEY=1
+            OUT=$("$SMC" -k BCLM -r 2>/dev/null || true)
+            echo "$OUT"
+            if echo "$OUT" | grep -qv "100" && echo "$OUT" | grep -qv "(bytes 64)" && echo "$OUT" | grep -qv "(bytes 00)"; then
+                BYPASSED=1
+            fi
+        fi
+
+        if check_key_exists "CHLT"; then
+            OUT=$("$SMC" -k CHLT -r 2>/dev/null || true)
+            echo "$OUT"
+        fi
+
+        if [ "$FOUND_KEY" -eq 1 ]; then
+            echo "BYPASS:$BYPASSED"
+            exit 0
+        else
+            echo "STATUS_UNKNOWN"
+            echo "BYPASS:0"
+            exit 0
+        fi
+        ;;
+    charge-off)
+        LIMIT="${2:-80}"
+        valid_limit "$LIMIT" || { echo "ERROR: invalid limit"; exit 2; }
+        HANDLED=0
+
+        # Method 1: Apple Silicon bfF0 / bfD0 / bfE0 (Firmware Limit for M3, M4, M5 / modern firmware)
+        if check_key_exists "bfF0"; then
+            HEX_UPPER=$(printf "%02x000000" "$LIMIT" 2>/dev/null || echo "50000000")
+            LOWER=$((LIMIT > 4 ? LIMIT - 3 : LIMIT))
+            HEX_LOWER=$(printf "%02x000000" "$LOWER" 2>/dev/null || echo "4d000000")
+            "$SMC" -k bfF0 -w 00 >/dev/null 2>&1 || true
+            if check_key_exists "bfD0"; then "$SMC" -k bfD0 -w "$HEX_UPPER" >/dev/null 2>&1 || true; fi
+            if check_key_exists "bfE0"; then "$SMC" -k bfE0 -w "$HEX_LOWER" >/dev/null 2>&1 || true; fi
+            if "$SMC" -k bfF0 -w 02 >/dev/null 2>&1; then
+                HANDLED=1
+            fi
+        fi
+
+        # Method 2: Apple Silicon CHTE (M1 updated firmware, M2, M3, M4, M5 Air/Pro/Max)
+        if check_key_exists "CHTE"; then
+            "$SMC" -k CHTE -w 01000000 >/dev/null 2>&1 && HANDLED=1
+        fi
+
+        # Method 3: Apple Silicon CH0B / CH0C (M1, M1 Pro, M1 Max)
+        if check_key_exists "CH0B"; then
+            "$SMC" -k CH0B -w 02 >/dev/null 2>&1 && HANDLED=1
+            if check_key_exists "CH0C"; then
+                "$SMC" -k CH0C -w 02 >/dev/null 2>&1 || true
+            fi
+        fi
+
+        # Method 4: Intel / Legacy BCLM (Battery Charge Limit Max)
+        if check_key_exists "BCLM"; then
+            HEX_LIMIT=$(printf "%02x" "$LIMIT" 2>/dev/null || echo "50")
+            "$SMC" -k BCLM -w "$HEX_LIMIT" >/dev/null 2>&1 && HANDLED=1
+        fi
+
+        if [ "$HANDLED" -eq 1 ]; then
+            echo "CHARGE_OFF_OK"
+            exit 0
+        else
+            echo "ERROR: No supported SMC charging key found"
+            exit 1
+        fi
+        ;;
+    charge-on)
+        CEILING_LIMIT="${2:-100}"
+        valid_limit "$CEILING_LIMIT" || { echo "ERROR: invalid limit"; exit 2; }
+        HANDLED=0
+
+        # Method 1: Apple Silicon bfF0 / bfD0 / bfE0
+        if check_key_exists "bfF0"; then
+            if [ "$CEILING_LIMIT" -lt 100 ] 2>/dev/null; then
+                HEX_UPPER=$(printf "%02x000000" "$CEILING_LIMIT" 2>/dev/null || echo "50000000")
+                LOWER=$((CEILING_LIMIT > 4 ? CEILING_LIMIT - 3 : CEILING_LIMIT))
+                HEX_LOWER=$(printf "%02x000000" "$LOWER" 2>/dev/null || echo "4d000000")
+                if check_key_exists "bfD0"; then "$SMC" -k bfD0 -w "$HEX_UPPER" >/dev/null 2>&1 || true; fi
+                if check_key_exists "bfE0"; then "$SMC" -k bfE0 -w "$HEX_LOWER" >/dev/null 2>&1 || true; fi
+                "$SMC" -k bfF0 -w 02 >/dev/null 2>&1 && HANDLED=1
+            else
+                "$SMC" -k bfF0 -w 00 >/dev/null 2>&1 && HANDLED=1
+                if check_key_exists "bfD0"; then "$SMC" -k bfD0 -w 64000000 >/dev/null 2>&1 || true; fi
+                if check_key_exists "bfE0"; then "$SMC" -k bfE0 -w 64000000 >/dev/null 2>&1 || true; fi
+            fi
+        fi
+
+        # Method 2: Apple Silicon CHTE (Release instant inhibit so battery can charge up to ceiling)
+        if check_key_exists "CHTE"; then
+            "$SMC" -k CHTE -w 00000000 >/dev/null 2>&1 && HANDLED=1
+        fi
+
+        # Method 3: Apple Silicon CH0B / CH0C (Release instant inhibit)
+        if check_key_exists "CH0B"; then
+            "$SMC" -k CH0B -w 00 >/dev/null 2>&1 && HANDLED=1
+            if check_key_exists "CH0C"; then
+                "$SMC" -k CH0C -w 00 >/dev/null 2>&1 || true
+            fi
+        fi
+
+        # Method 4: Intel / Legacy BCLM
+        if check_key_exists "BCLM"; then
+            HEX_LIMIT=$(printf "%02x" "$CEILING_LIMIT" 2>/dev/null || echo "64")
+            "$SMC" -k BCLM -w "$HEX_LIMIT" >/dev/null 2>&1 && HANDLED=1
+        fi
+
+        if [ "$HANDLED" -eq 1 ]; then
+            echo "CHARGE_ON_OK"
+            exit 0
+        else
+            echo "ERROR: No supported SMC charging key found"
+            exit 1
+        fi
+        ;;
+    fan-count)
+        "$SMC" -k FNum -r
+        ;;
+    fan-info)
+        ID="${2:-0}"
+        case "$ID" in [0-3]) ;; *) echo "ERROR: invalid fan id"; exit 2 ;; esac
+        echo "ACTUAL:" $("$SMC" -k "F${ID}Ac" -r 2>/dev/null || true)
+        echo "MIN:" $("$SMC" -k "F${ID}Mn" -r 2>/dev/null || true)
+        echo "MAX:" $("$SMC" -k "F${ID}Mx" -r 2>/dev/null || true)
+        echo "TARGET:" $("$SMC" -k "F${ID}Tg" -r 2>/dev/null || true)
+        echo "MODE:" $("$SMC" -k "F${ID}Md" -r 2>/dev/null || true)
+        ;;
+    version)
+        echo "HELPER_VERSION:3"
+        ;;
+    fan-set)
+        ID="${2:-0}"
+        RPM="$3"
+        # Chỉ nhận số nguyên hợp lệ; chặn mọi đối số lạ (helper chạy bằng root).
+        case "$ID" in [0-3]|all) ;; *) echo "ERROR: invalid fan id"; exit 2 ;; esac
+        case "$RPM" in ''|*[!0-9]*) echo "ERROR: invalid rpm"; exit 2 ;; esac
+        if check_key_exists "Ftst"; then
+            "$SMC" -k Ftst -w 01 >/dev/null 2>&1 || true
+        fi
+        if [ "$ID" = "all" ]; then
+            FNUM=$("$SMC" -k FNum -r 2>/dev/null | awk '{print int($4)}')
+            FNUM="${FNUM:-1}"
+            I=0
+            while [ "$I" -lt "$FNUM" ] && [ "$I" -lt 4 ]; do
+                FMIN=$("$SMC" -k "F${I}Mn" -r 2>/dev/null | awk '{print int($4)}')
+                FMAX=$("$SMC" -k "F${I}Mx" -r 2>/dev/null | awk '{print int($4)}')
+                if [ -n "$FMIN" ] && [ -n "$FMAX" ] && [ "$FMAX" -gt 0 ]; then
+                    CLAMPED="$RPM"
+                    if [ "$CLAMPED" -lt "$FMIN" ]; then CLAMPED="$FMIN"; fi
+                    if [ "$CLAMPED" -gt "$FMAX" ]; then CLAMPED="$FMAX"; fi
+                    HEX=$(/usr/bin/perl -e 'print unpack("H*", pack("f<", $ARGV[0]))' "$CLAMPED")
+                    "$SMC" -k "F${I}Md" -w 01 >/dev/null 2>&1 || true
+                    "$SMC" -k "F${I}Tg" -w "$HEX" >/dev/null 2>&1 || true
+                fi
+                I=$((I + 1))
+            done
+            echo "FAN_SET_OK"
+        else
+            FMIN=$("$SMC" -k "F${ID}Mn" -r 2>/dev/null | awk '{print int($4)}')
+            FMAX=$("$SMC" -k "F${ID}Mx" -r 2>/dev/null | awk '{print int($4)}')
+            if [ -z "$FMIN" ] || [ -z "$FMAX" ] || [ "$FMAX" -le 0 ]; then
+                echo "ERROR: fan range unavailable"; exit 3
+            fi
+            CLAMPED="$RPM"
+            if [ "$CLAMPED" -lt "$FMIN" ]; then CLAMPED="$FMIN"; fi
+            if [ "$CLAMPED" -gt "$FMAX" ]; then CLAMPED="$FMAX"; fi
+            # float32 little-endian hex (vd 3000 -> 00803b45)
+            HEX=$(/usr/bin/perl -e 'print unpack("H*", pack("f<", $ARGV[0]))' "$CLAMPED")
+            "$SMC" -k "F${ID}Md" -w 01 >/dev/null 2>&1 || { echo "ERROR: mode write failed"; exit 4; }
+            "$SMC" -k "F${ID}Tg" -w "$HEX" >/dev/null 2>&1 || { echo "ERROR: target write failed"; exit 4; }
+            echo "FAN_SET_OK"
+        fi
+        ;;
+    fan-auto)
+        ID="${2:-all}"
+        case "$ID" in [0-3]|all) ;; *) echo "ERROR: invalid fan id"; exit 2 ;; esac
+        if [ "$ID" = "all" ]; then
+            for I in 0 1 2 3; do
+                if check_key_exists "F${I}Md"; then
+                    "$SMC" -k "F${I}Md" -w 00 >/dev/null 2>&1 || true
+                    "$SMC" -k "F${I}Tg" -w 00000000 >/dev/null 2>&1 || true
+                fi
+            done
+        else
+            "$SMC" -k "F${ID}Md" -w 00 >/dev/null 2>&1 || true
+            "$SMC" -k "F${ID}Tg" -w 00000000 >/dev/null 2>&1 || true
+        fi
+        if check_key_exists "Ftst"; then
+            "$SMC" -k Ftst -w 00 >/dev/null 2>&1 || true
+        fi
+        echo "FAN_AUTO_OK"
+        ;;
+    *)
+        echo "Usage: $0 {status|charge-off [limit]|charge-on|version|fan-count|fan-info|fan-set <id> <rpm>|fan-auto <id>}"
+        exit 1
+        ;;
+esac
